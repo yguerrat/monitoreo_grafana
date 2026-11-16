@@ -1,0 +1,195 @@
+# Laboratorio DevSecOps local: Flask genera métricas y logs.
+# Las contraseñas se crean al iniciar y se montan como secretos; no van en este archivo.
+name: laboratorio-monitoreo
+
+services:
+  # Aplicación de ejemplo: responde en localhost:8000 y envía logs a Logstash.
+  flask_service:
+    build: ./app
+    ports:
+      - "127.0.0.1:${LAB_APP_PORT:-8000}:8000"
+    environment:
+      LOGSTASH_URL: http://logstash:8080
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - release_data:/release:ro
+    depends_on:
+      - logstash
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Recolecta métricas de Flask y de sí mismo cada 10 segundos.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "127.0.0.1:${LAB_PROM_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    restart: unless-stopped
+
+  # Crea paneles con los datos que recibe de Prometheus.
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "127.0.0.1:${LAB_GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_password
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+    secrets:
+      - grafana_password
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Guarda los logs de la práctica en un solo nodo local.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    entrypoint: ["/bin/tini", "--", "/bin/bash", "/setup/start-elasticsearch.sh"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "true"
+      xpack.security.enrollment.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "127.0.0.1:${LAB_ES_PORT:-9200}:9200"
+    secrets:
+      - elastic_password
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+      - ./elastic/start-elasticsearch.sh:/setup/start-elasticsearch.sh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -u \"elastic:$$(cat /run/secrets/elastic_password)\" http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  # Crea cuentas internas y un usuario alumno con acceso limitado a los logs.
+  security_setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    entrypoint: ["/bin/bash", "/setup/setup.sh"]
+    volumes:
+      - ./elastic/setup.sh:/setup/setup.sh:ro
+    secrets:
+      - elastic_password
+      - kibana_password
+      - logstash_password
+      - alumno_password
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+
+  # Recibe los logs de Flask y los envía a Elasticsearch.
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.0
+    entrypoint: ["/bin/bash", "/setup/start-logstash.sh"]
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+      XPACK_MONITORING_ENABLED: "false"
+    volumes:
+      - ./logstash/pipeline.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+      - ./logstash/start-logstash.sh:/setup/start-logstash.sh:ro
+    secrets:
+      - logstash_password
+      - logstash_keystore_password
+    depends_on:
+      security_setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Permite buscar y visualizar los logs guardados en Elasticsearch.
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    entrypoint: ["/bin/tini", "--", "/bin/bash", "/setup/start-kibana.sh"]
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: kibana_system
+      NODE_OPTIONS: --max-old-space-size=512
+    ports:
+      - "127.0.0.1:${LAB_KIBANA_PORT:-5601}:5601"
+    volumes:
+      - ./kibana/start-kibana.sh:/setup/start-kibana.sh:ro
+    secrets:
+      - kibana_password
+      - kibana_session_key
+      - kibana_saved_objects_key
+    depends_on:
+      security_setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Prepara el volumen para que Jenkins publique sin permisos de administrador.
+  release_init:
+    image: alpine:3.20
+    profiles: [jenkins]
+    command: ["sh", "-c", "chown 1000:1000 /release"]
+    volumes:
+      - release_data:/release
+    restart: "no"
+
+  # Jenkins es opcional: lee GitHub y publica un mensaje visible en la app.
+  jenkins:
+    build: ./jenkins
+    profiles: [jenkins]
+    ports:
+      - "127.0.0.1:${LAB_JENKINS_PORT:-8080}:8080"
+    environment:
+      JAVA_OPTS: -Xms256m -Xmx768m
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - release_data:/release
+    depends_on:
+      release_init:
+        condition: service_completed_successfully
+      flask_service:
+        condition: service_healthy
+    restart: unless-stopped
+
+# Estos volúmenes conservan métricas, paneles y logs al reiniciar.
+volumes:
+  prometheus_data:
+  grafana_data:
+  elasticsearch_data:
+  jenkins_data:
+  release_data:
+
+secrets:
+  elastic_password:
+    file: ./secrets/elastic_password.txt
+  kibana_password:
+    file: ./secrets/kibana_password.txt
+  logstash_password:
+    file: ./secrets/logstash_password.txt
+  logstash_keystore_password:
+    file: ./secrets/logstash_keystore_password.txt
+  alumno_password:
+    file: ./secrets/alumno_password.txt
+  grafana_password:
+    file: ./secrets/grafana_password.txt
+  kibana_session_key:
+    file: ./secrets/kibana_session_key.txt
+  kibana_saved_objects_key:
+    file: ./secrets/kibana_saved_objects_key.txt

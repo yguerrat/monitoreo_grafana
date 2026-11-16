@@ -1,0 +1,1 @@
+Servicio de prueba activo. Visita /error para generar un error controlado.

@@ -1,0 +1,6 @@
+# Las contraseñas son distintas en cada equipo y no deben compartirse.
+secrets/
+.env
+.venv/
+__pycache__/
+*.pyc

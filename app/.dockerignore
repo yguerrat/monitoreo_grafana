@@ -1,0 +1,3 @@
+# Archivos temporales de Python que no deben copiarse a la imagen Docker.
+__pycache__/
+*.pyc
